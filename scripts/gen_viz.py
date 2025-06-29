@@ -1,0 +1,666 @@
+import os
+import json
+from src.smplx_support.body_segments import SMPLX_PART_BOUNDS, PART_VID_FID, SimpleCoM
+import subprocess
+import bpy
+import numpy as np
+import torch
+from smplx import SMPLX
+from scipy.spatial.transform import Rotation as R
+import contextlib
+from tqdm import tqdm
+import math
+import mathutils
+
+@contextlib.contextmanager
+def suppress_output(enabled=True):
+    """Suppress stdout and stderr even for native code (e.g., Blender)."""
+    if not enabled:
+        yield
+        return
+
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    # Save original file descriptors
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+
+    try:
+        # Redirect stdout and stderr to devnull
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        # Restore original file descriptors
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
+        os.close(devnull)
+# ------------------------------------------------------------------------------
+#                                     CONFIG
+# ------------------------------------------------------------------------------
+MAX_FRAMES=np.inf
+OVERWRITE=False
+DEBUG=False
+
+cfg_global = {
+    'mesh': {
+        'npz_path':           'PSU_AMASS/Subject1_MOCAP_MRK_1_gt_stageii.npz',
+        'model_folder':       'body_models/smplx',          # contains e.g. SMPLX_FEMALE.npz
+        'output_obj_dir':     'output_objs',
+        'gender':             'female',
+        'ds_rate':            5,     # down-sample every N frames
+        'num_betas':          10,
+        'scale_cm_to_m':      False,
+    },
+    'motion': {
+        'coordinate_system': 'global',  # 'local' or 'global'
+    },
+    'env': {
+        'floor_size': 10 # suggested 10 or 3
+    },
+    'output': {
+        'save_npz': True,  # save the .npz file after conveting everything
+        'save_blend': False,  # save the .blend file after rendering
+    },
+    'dirs': {
+        'save_dir':         'output',  # where to save all results
+        'render_out_dir':     'render',
+        'cleanup_objs':     True,  # remove old output dirs if they exist
+        'cleanup_imgs':   False,  # remove old output dirs if they exist
+    },
+    'render': {
+        'engine':             'CYCLES',  # or 'CYCLES'
+        'cycles_samples':     5,
+        'device':           'GPU',  # 'CPU' or 'GPU'
+        'cycles_denoise':     True,
+        'eevee_gtao':         True,
+        'eevee_shadow_size':  512,
+        'resolution':         (1920, 1080),
+        'stop_early':  False, # render only the first frame
+        'suppress_output': True,
+        'camera_view': 2, # view 1 or 2 if global
+        "render_com": 'none', # options include ['xyz', 'xy', 'none']
+    },
+}
+# ------------------------------------------------------------------------------
+#                                  MESH CONVERSION
+# ------------------------------------------------------------------------------
+import pickle
+def load_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+    
+def rotate_points_xyz(pts, angles_deg):
+    """Rotate points by Euler angles (in degrees) around x, y, z axes."""
+    Rmat = R.from_euler('xyz', angles_deg, degrees=True).as_matrix()
+    return np.einsum('ij,bnj->bni', Rmat, pts)
+
+def convert_npz_to_objs(cfg):
+    """Load NPZ, run SMPL-X, write per-frame .obj files, return list of paths + initial trans/orient for camera."""
+    data = np.load(cfg['mesh']['npz_path'])
+    model = SMPLX(
+        model_path=os.path.join(cfg['mesh']['model_folder'],
+                                f"SMPLX_{cfg['mesh']['gender'].upper()}.npz"),
+        gender=cfg['mesh']['gender'],
+        batch_size=1)
+    
+    trans       = data['trans']
+    root_orient = data['root_orient']
+    pose_body   = data['pose_body']
+    pose_hand   = data['pose_hand']
+    jaw_pose    = data['pose_jaw']
+    eye_pose    = data['pose_eye']
+    betas       = data['betas'][:cfg['mesh']['num_betas']]
+
+    scale = 0.01 if cfg['mesh']['scale_cm_to_m'] else 1.0  # cm → m
+    coordinate_system = cfg['motion']['coordinate_system']
+
+    if coordinate_system == 'local':
+        # Compute subject's initial heading angle (to rotate to +Y)
+        from cv2 import Rodrigues
+        R0, _ = Rodrigues(root_orient[0])
+        theta_z_deg = np.rad2deg(np.arctan2(R0[1, 0], R0[0, 0]))
+        print(f"[INFO] Local mode: rotating subject -{theta_z_deg:.2f}° to face camera")
+
+    out_paths = []
+    for i in tqdm(range(0, trans.shape[0], cfg['mesh']['ds_rate']), desc="Converting frames to OBJ"):
+        name = os.path.join(cfg['dirs']['obj_dir'], f"frame_{i:05d}.obj") 
+        if not OVERWRITE and os.path.exists(name):
+            if DEBUG:
+                print(f"[DEBUG] Skipping existing file: {name}")
+            continue
+
+        inputs = {
+            'global_orient':     torch.tensor(root_orient[i:i+1], dtype=torch.float32),
+            'body_pose':         torch.tensor(pose_body[i:i+1],   dtype=torch.float32),
+            'betas':             torch.tensor(betas[None],         dtype=torch.float32),
+            'jaw_pose':          torch.tensor(jaw_pose[i:i+1],    dtype=torch.float32),
+            'leye_pose':         torch.tensor(eye_pose[i:i+1,:3], dtype=torch.float32),
+            'reye_pose':         torch.tensor(eye_pose[i:i+1,3:], dtype=torch.float32),
+            'left_hand_pose':    torch.tensor(pose_hand[i,0].reshape(1,-1), dtype=torch.float32),
+            'right_hand_pose':   torch.tensor(pose_hand[i,1].reshape(1,-1), dtype=torch.float32),
+        }
+        if coordinate_system == 'global':
+            inputs['transl'] =torch.tensor(trans[i:i+1], dtype=torch.float32) * scale
+        
+
+        out = model(**inputs, return_verts=True)
+        verts = out.vertices[0].detach().numpy()  # (V, 3)
+        faces = model.faces
+
+        verts = verts[None, ...]  # (1, V, 3)
+        
+        if coordinate_system == 'local':
+            # Rotate entire mesh to face +Y (Blender forward)
+            verts = rotate_points_xyz(verts, [0, 0, -theta_z_deg])
+            verts = rotate_points_xyz(verts, [-90, 0, 0])  # Z-up → Y-up
+            
+        elif coordinate_system == 'global':
+            # Trust global orientation and translation; only convert coordinate systems
+            verts = rotate_points_xyz(verts, [-90, 0, 0])  # Z-up → Y-up
+            if DEBUG:
+                print(f"Min dim 0: {np.min(verts[0,:,0])}")
+                print(f"Min dim 1: {np.min(verts[0,:,1])}")
+                print(f"Min dim 2: {np.min(verts[0,:,2])}")
+
+        verts = verts[0]  # (V, 3)
+        t_faces = model.faces
+        t_faces = t_faces.astype(np.int32)  # As type int32
+        t_faces = torch.from_numpy(t_faces)
+        t_faces = t_faces.to('cpu')  # [F, 3]
+        part_vid_fid = load_pickle(PART_VID_FID)        # dict part → {vert_id, face_id}
+        part_bounds  = load_pickle(SMPLX_PART_BOUNDS)   # dict part → boundary vids
+        com_calc = SimpleCoM(part_vid_fid, part_bounds, t_faces)
+        t_verts = np.copy(verts)  # [V, 3]
+        t_verts = torch.from_numpy(t_verts).to('cpu')  # [V, 3]
+        t_verts = t_verts.unsqueeze(0)  # [1, V, 3]
+        com = com_calc.compute_com(t_verts)  # [1, 3]
+        com_np = com.detach().numpy()
+        com_np = com_np.reshape(1, 1, 3)  # shape (B=1, N=1, 3)
+        com_np = com_np[0, 0]  # (3,)
+             
+        with open(name, 'w') as f:
+            for v in verts:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            for face in faces:
+                f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+        out_paths.append({'frame': i, 'path': name, 'com': com_np})
+
+        if cfg['output'].get('save_npz'):
+            save_path = os.path.join(cfg['dirs']['npz_dir'], f"frame_{i:05d}.npz")
+            np.savez_compressed(save_path,
+                                verts=verts.astype(np.float32),
+                                faces=faces.astype(np.int32),
+                                com=com_np.astype(np.float32))
+    
+        if cfg['render']['stop_early'] or len(out_paths) >= MAX_FRAMES:
+            break
+
+    return out_paths
+# ------------------------------------------------------------------------------
+#                                 SCENE SETUP
+# ------------------------------------------------------------------------------
+def clear_scene():
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+def set_world_background_color(color=(1.0, 1.0, 1.0, 1.0), strength=1.0):
+    """Set the world background to a specific color (white by default)."""
+    world = bpy.data.worlds["World"]
+    world.use_nodes = True
+    bg = world.node_tree.nodes["Background"]
+    bg.inputs[0].default_value = color  # RGBA
+    bg.inputs[1].default_value = strength  # Strength
+
+def set_world_transparent():
+    """Replace the World background with a truly transparent shader."""
+    world = bpy.data.worlds["World"]
+    world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+
+    # remove any existing background nodes
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # create a transparent node + output
+    transp = nodes.new(type="ShaderNodeBsdfTransparent")
+    out   = nodes.new(type="ShaderNodeOutputWorld")
+
+    links.new(transp.outputs["BSDF"], out.inputs["Surface"])
+
+def enable_transparent_background():
+    scene = bpy.context.scene
+    scene.render.film_transparent = True  # Only for Cycles and Eevee Next
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.image_settings.color_mode = 'RGBA'
+
+def force_background_to_white_compositor():
+    """Force the render background to pure white using Blender's compositor (post-render)."""
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    tree = scene.node_tree
+    nodes = tree.nodes
+    links = tree.links
+
+    # Clear existing nodes
+    for node in nodes:
+        nodes.remove(node)
+
+    # 1. Render Layers node (input from renderer)
+    render_layers = nodes.new(type='CompositorNodeRLayers')
+
+    # 2. Alpha Over node (composite over white)
+    alpha_over = nodes.new(type='CompositorNodeAlphaOver')
+    alpha_over.inputs[1].default_value = (1, 1, 1, 1)  # solid white RGBA
+
+    # 3. Composite output node
+    composite = nodes.new(type='CompositorNodeComposite')
+
+    # Connect the nodes
+    links.new(render_layers.outputs['Image'], alpha_over.inputs[2])  # Image → bottom
+    links.new(alpha_over.outputs['Image'], composite.inputs['Image'])
+    # links.new(alpha_over.outputs['Image'], viewer.inputs['Image'])  # for preview
+
+def setup_floor(floor_size=4, z_offset=-0.85):
+    # 1) Create or grab the plane object
+    if "CheckeredFloor" in bpy.data.objects:
+        floor = bpy.data.objects["CheckeredFloor"]
+    else:
+        bpy.ops.mesh.primitive_plane_add(size=floor_size, location=(0, 0, z_offset))
+        floor = bpy.context.active_object
+        floor.name = "CheckeredFloor"
+
+    # 2) Create the checker material if needed
+    if "CheckeredMaterial" not in bpy.data.materials:
+        mat = bpy.data.materials.new(name="CheckeredMaterial")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        # clear default nodes
+        for n in nodes:
+            nodes.remove(n)
+
+        # build the node graph
+        out_node     = nodes.new(type='ShaderNodeOutputMaterial')
+        bsdf_node    = nodes.new(type='ShaderNodeBsdfPrincipled')
+        checker_node = nodes.new(type='ShaderNodeTexChecker')
+        coord_node   = nodes.new(type='ShaderNodeTexCoord')
+        mapping_node = nodes.new(type='ShaderNodeMapping')
+
+        # configure checker
+        checker_node.inputs['Color1'].default_value = (0.8, 0.8, 0.8, 1.0)
+        checker_node.inputs['Color2'].default_value = (0.2, 0.2, 0.2, 1.0)
+        mapping_node.inputs['Scale'].default_value   = (10.0, 10.0, 10.0)
+
+        # wire it up
+        links.new(coord_node.outputs['UV'],          mapping_node.inputs['Vector'])
+        links.new(mapping_node.outputs['Vector'],    checker_node.inputs['Vector'])
+        links.new(checker_node.outputs['Color'],     bsdf_node.inputs['Base Color'])
+        links.new(bsdf_node.outputs['BSDF'],         out_node.inputs['Surface'])
+
+        # kill all reflections
+        bsdf_node.inputs['Roughness'].default_value = 1.0
+        if "Specular" in bsdf_node.inputs:
+            bsdf_node.inputs["Specular"].default_value = 0.0
+        # If using Blender 4.x: also try this
+        else:
+            bsdf_node.inputs["Specular IOR Level"].default_value = 0.0
+
+    # 3) Assign the material
+    floor.data.materials.clear()
+    floor.data.materials.append(bpy.data.materials["CheckeredMaterial"])
+    return floor
+
+import math
+def setup_light(cfg):
+    # remove any existing lights
+    for obj in list(bpy.data.objects):
+        if obj.type == 'LIGHT':
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    # add a Sun lamp
+    bpy.ops.object.light_add(type='SUN', location=(0, 0, 10))
+    sun = bpy.context.active_object
+
+    # aim it down at roughly 45° toward the origin
+    sun.rotation_euler = (
+        math.radians(0),   # tilt down
+        math.radians(0),
+        math.radians(180)    # rotate around Z
+    )
+
+    # energy controls brightness
+    if cfg['motion']['coordinate_system'] == 'local':
+        sun.data.energy = 3.0
+    else:
+        sun.data.energy = 3.0
+
+    # angle controls softness of shadows (bigger = softer)
+    sun.data.angle = math.radians(5)   # try 5°–10° for pleasing penumbra
+    return sun
+
+def setup_camera(cfg):
+    if cfg['motion']['coordinate_system'] == 'local':
+        tgt_z = -0.30
+        tgt_loc = mathutils.Vector((0.0, 0.0, tgt_z))
+ 
+        distance = 7.0
+        height = 2.0
+        cam_pos = mathutils.Vector((0.0, -distance, height))
+
+        # Create camera and target
+        bpy.ops.object.camera_add(location=cam_pos)
+        cam = bpy.context.active_object
+        cam.name = "TrackingCamera"
+
+        tgt = bpy.data.objects.new("CamTarget", None)
+        bpy.context.scene.collection.objects.link(tgt)
+        tgt.location = tgt_loc
+
+        # Apply tracking constraint
+        constraint = cam.constraints.new('TRACK_TO')
+        constraint.target = tgt
+        constraint.track_axis = 'TRACK_NEGATIVE_Z'
+        constraint.up_axis = 'UP_Y'
+
+        bpy.context.scene.camera = cam
+        return cam
+
+    else:
+        square_half_size = cfg['env']['floor_size'] / 2.0
+        margin = 1.9
+        height = 3.5
+        target_z = -0.5  # slightly above ground (e.g., pelvis or torso)
+
+        camera_view = cfg['render']['camera_view']
+        if camera_view == 1:
+            cam_x = -square_half_size * margin
+            cam_y =  square_half_size * margin
+        elif camera_view == 2:
+            cam_x =  square_half_size * margin
+            cam_y =  square_half_size * margin
+        else:
+            raise ValueError("Unsupported camera_view: should be 1 or 2")
+
+        cam_pos = mathutils.Vector((cam_x, cam_y, height))
+        tgt_pos = mathutils.Vector((0.0, 0.0, target_z))
+        direction = (tgt_pos - cam_pos).normalized()
+
+        # Create camera and aim it
+        bpy.ops.object.camera_add(location=cam_pos)
+        cam = bpy.context.active_object
+        cam.name = "TrackingCamera"
+
+        # Point camera toward target
+        cam_direction = -direction
+        up = mathutils.Vector((0, 0, 1))
+        right = up.cross(cam_direction).normalized()
+        real_up = cam_direction.cross(right).normalized()
+
+        rot_matrix = mathutils.Matrix((right, real_up, cam_direction)).transposed()
+        cam.rotation_euler = rot_matrix.to_euler()
+        # Set as scene camera
+        bpy.context.scene.camera = cam
+        return cam
+
+def apply_render_settings(cfg, res_multiplier=1.0, png_compression=20, use_jpeg=False, jpeg_quality=90):
+    sc = bpy.context.scene
+    sc.render.engine = cfg['render']['engine']
+    w, h = cfg['render']['resolution']
+    sc.render.resolution_x = int(w * res_multiplier)
+    sc.render.resolution_y = int(h * res_multiplier)
+    sc.render.resolution_percentage = 100  # always interpret resolution_x/y as final pixels
+
+    if cfg['render']['engine'] == 'CYCLES':
+        sc.cycles.device = cfg['render']['device']
+        sc.cycles.samples = cfg['render']['cycles_samples']
+        sc.cycles.use_denoising = cfg['render']['cycles_denoise']
+    else:
+        ee = sc.eevee
+        ee.use_ssr         = cfg['render']['eevee_ssr']
+        ee.use_gtao        = cfg['render']['eevee_gtao']
+        ee.use_bloom       = cfg['render']['eevee_bloom']
+        ee.shadow_cube_size = cfg['render']['eevee_shadow_size']
+        
+    if use_jpeg:
+        sc.render.image_settings.file_format = 'JPEG'
+        sc.render.image_settings.quality     = jpeg_quality  # 0–100
+    else:
+        sc.render.image_settings.file_format  = 'PNG'
+        sc.render.image_settings.compression   = png_compression  # 0 (no) – 100 (max)
+
+    sc.render.image_settings.color_mode = 'RGBA'  # keep alpha if you need it
+# ------------------------------------------------------------------------------
+#                               IMPORT & RENDER LOOP
+# ------------------------------------------------------------------------------
+def create_smplx_material(alpha=1.0):
+    """
+    Build a Principled BSDF with:
+      • high roughness, low specular
+      • a bit of subsurface scattering
+      • subtle sheen
+      • noise‐driven roughness variation
+    """
+    name = "SMPLX_Mat"
+    mat  = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    # clear any default nodes
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # Output
+    out_bsdf = nodes.new("ShaderNodeOutputMaterial")
+    out_bsdf.location = (400, 0)
+
+    # Principled BSDF
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (0, 0)
+    bsdf.inputs["Base Color"].default_value       = (1.0, 0.4, 0.4, 1.0)
+    bsdf.inputs["Alpha"].default_value            = alpha 
+    bsdf.inputs["Roughness"].default_value        = 0.7      # soften highlights
+    if "Specular" in bsdf.inputs:
+        bsdf.inputs["Specular"].default_value=0.2
+    else:
+        bsdf.inputs["Specular IOR Level"].default_value = 0.2
+        
+    bsdf.inputs["Metallic"].default_value         = 0.0      # non‐metal
+    # -- Subsurface (called “Subsurface Weight”) --
+    if "Subsurface Weight" in bsdf.inputs:
+        bsdf.inputs["Subsurface Weight"].default_value = 0.1
+    if "Subsurface Radius" in bsdf.inputs:
+        bsdf.inputs["Subsurface Radius"].default_value = (0.1, 0.1, 0.1)
+
+    # -- Sheen --
+    if "Sheen Weight" in bsdf.inputs:
+        bsdf.inputs["Sheen Weight"].default_value = 0.15
+    if "Sheen Tint" in bsdf.inputs:
+        bsdf.inputs["Sheen Tint"].default_value = (0.5, 0.5, 0.5, 1.0)
+
+    # Noise for micro‐variation in roughness
+    noise = nodes.new("ShaderNodeTexNoise")
+    noise.location = (-300, 0)
+    noise.inputs["Scale"].default_value = 20.0
+    links.new(noise.outputs["Fac"], bsdf.inputs["Roughness"])
+
+    # Link BSDF → Output
+    links.new(bsdf.outputs["BSDF"], out_bsdf.inputs["Surface"])
+    return mat
+
+def import_and_render(objs, cfg):
+    suppress = cfg['render'].get('suppress_output', False)
+    for i, data in tqdm(enumerate(objs), desc="Rendering frames", total=len(objs)):
+        frame_num = data['frame']
+        path = data['path']
+        outpath = os.path.join(cfg['dirs']['render_out_dir'], f"frame_{frame_num:05d}.png")
+        if not OVERWRITE and os.path.exists(outpath):
+            continue 
+        
+        with suppress_output(enabled=suppress):
+            bpy.ops.wm.obj_import(filepath=path)
+            obj = bpy.context.selected_objects[0]
+            obj.name = f"frame_{frame_num:05d}"
+            alpha = 1.0 if cfg['render']['render_com'] == 'none' else 0.5
+            mat = create_smplx_material(alpha=alpha)
+            obj.data.materials.append(mat)
+
+            if  'com' in data and cfg['render']['render_com'] != 'none':
+                com_coord  = data['com']  # numpy (x, y, z)
+                # Convert to Blender's coordinate system (Z-up, Y-forward)
+                if cfg['motion']['coordinate_system'] == 'local':
+                    com_coord = rotate_points_xyz(com_coord.reshape(1, 1, 3), [0, 0, -90])[0, 0]
+                elif cfg['motion']['coordinate_system'] == 'global':
+                    com_coord = rotate_points_xyz(com_coord.reshape(1, 1, 3), [-90, 0, 0])[0, 0]
+                    com_coord = np.array((com_coord[0], -com_coord[1], com_coord[2]))
+                    print(f"[DEBUG] CoM in global coords: {com_coord}")
+                else:
+                    raise ValueError(f"Unsupported coordinate system: {cfg['motion']['coordinate_system']}")
+                
+                com_coord[2] *= -1  # Flip Z
+                bpy.ops.mesh.primitive_uv_sphere_add(
+                    radius=0.05,                      # adjust size as needed
+                    location=tuple(com_coord),
+                    segments=16,
+                    ring_count=8
+                )
+                marker = bpy.context.active_object
+                marker.name = f"CoM_marker_{frame_num:05d}"
+                # red, fully opaque
+                com_mat = bpy.data.materials.get("CoM_Mat") or bpy.data.materials.new("CoM_Mat")
+                com_mat.diffuse_color = (1.0, 0.0, 0.0, 1.0)
+                marker.data.materials.append(com_mat)
+
+            if cfg['output']['save_blend']:
+                blend_path = os.path.join(cfg['dirs']['blend_dir'], f"frame_{frame_num:05d}.blend")
+                if OVERWRITE and os.path.exists(blend_path):
+                    os.remove(blend_path)
+                bpy.ops.wm.save_as_mainfile(filepath=blend_path)
+                
+            bpy.context.scene.render.filepath = outpath
+            bpy.ops.render.render(write_still=True)
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+        if cfg['render']['stop_early'] or i >= MAX_FRAMES:
+            break
+# ------------------------------------------------------------------------------
+#                                     MAIN
+# ------------------------------------------------------------------------------
+def frames_to_video(frame_dir, output_path, fps=50):
+    """
+    Use ffmpeg to stitch a directory of PNG frames named frame_00000.png, frame_00001.png, … into a video.
+    """
+    frame_paths = sorted([
+        os.path.join(frame_dir, fname)
+        for fname in os.listdir(frame_dir)
+        if fname.endswith(".png")
+    ])
+
+    # Create temporary frames.txt file
+    list_path = os.path.join(frame_dir, "frames.txt")
+    with open(list_path, "w") as f:
+        for path in frame_paths:
+            f.write(f"file '{os.path.abspath(path)}'\n")
+
+    # Build ffmpeg command using concat mode
+    cmd = [
+        "ffmpeg",
+        "-y",                        # Overwrite output file if exists
+        "-r", str(fps),              # Input framerate
+        "-f", "concat",
+        "-safe", "0",                # Allow absolute paths
+        "-i", list_path,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    print(f"[INFO] Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    print(f"[INFO] Video saved to: {output_path}")
+ 
+def cleanup_dirs(cfg):
+    """
+    Remove old output directories if they exist.
+    """
+    import shutil 
+    # Force removal of old directories
+    if cfg['dirs']['cleanup_objs']:
+        shutil.rmtree(cfg['dirs']['obj_dir'], ignore_errors=True)
+    if cfg['dirs']['cleanup_imgs']:
+        shutil.rmtree(cfg['dirs']['render_out_dir'], ignore_errors=True)
+    
+def setup_dirs(cfg, subject_name, take_name): 
+    """
+    Update save_dir, obj_dir, render_dir to follow structured output:
+    output_dir/Subject/Take_N/<coordinate_system>/{objs,images,config}
+    """
+    coord_system = cfg['motion']['coordinate_system']
+    cam_view = f"V{cfg['render']['camera_view']}" if coord_system == 'global' else ''
+    base_dir = os.path.join(cfg['dirs']['save_dir'], subject_name, take_name, coord_system)
+    if cam_view:
+        base_dir = os.path.join(base_dir, cam_view)
+        
+    obj_dir = os.path.join(base_dir, 'objs')
+    render_dir = os.path.join(base_dir, 'images')
+    blend_dir = os.path.join(base_dir, 'blends')
+    npz_dir = os.path.join(base_dir, 'npz')
+
+    cfg['dirs']['blend_dir'] = blend_dir
+    cfg['dirs']['obj_dir'] = obj_dir
+    cfg['dirs']['render_out_dir'] = render_dir
+    cfg['dirs']['save_dir'] = base_dir  # unify root
+    cfg['dirs']['npz_dir'] = npz_dir
+
+    os.makedirs(obj_dir, exist_ok=True)
+    os.makedirs(blend_dir, exist_ok=True)
+    os.makedirs(render_dir, exist_ok=True)
+    if cfg['output'].get('save_npz'):
+        os.makedirs(npz_dir, exist_ok=True)
+
+    # Save config as JSON in the same folder
+    config_out = os.path.join(base_dir, 'config.json')
+    with open(config_out, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+    return cfg
+ 
+def main():
+    cfg = cfg_global.copy()  # avoid modifying global cfg directly
+    cfg = setup_dirs(cfg, subject_name="Subject1", take_name="Take_1")
+    #obj_paths = convert_npz_to_objs(cfg)
+
+    # 2) Prep Blender scene
+    clear_scene()
+    z_offset = 0.0 if cfg['motion']['coordinate_system'] == 'global' else -0.85
+    setup_floor(floor_size=cfg['env']['floor_size'],z_offset=z_offset)
+    setup_light(cfg)
+    setup_camera(cfg)
+
+ 
+    apply_render_settings(cfg)
+    bpy.context.scene.view_settings.view_transform = 'Standard'
+    bpy.context.scene.view_settings.look = 'None'
+    enable_transparent_background()
+    force_background_to_white_compositor()
+
+    # 3) Import each OBJ & render
+    #import_and_render(obj_paths, cfg)
+    print("All done generating frames!")
+  
+    video_path = os.path.join(cfg['dirs']['save_dir'], 'render.mp4')
+    with suppress_output(enabled=cfg['render']['suppress_output']):
+        frames_to_video(
+            os.path.join(cfg['dirs']['render_out_dir']),
+            video_path,
+            fps=cfg['render'].get('fps', 50)  # default to 50 FPS if not specified
+        )
+    
+    cleanup_dirs(cfg)
+
+if __name__ == "__main__":
+    main()
