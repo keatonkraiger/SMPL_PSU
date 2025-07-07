@@ -1,0 +1,17 @@
+[project]
+name = "SMPL_PSU"
+version = "0.1.0"
+description = "SMPL-based visualization tools and Blender integration"
+authors = [
+    { name = "Keaton Kraiger", email = "keatonkraiger@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = [""]  # look from the root
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

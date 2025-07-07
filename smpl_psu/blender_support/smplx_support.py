@@ -2,6 +2,63 @@ import os
 import numpy as np
 import torch
 from smplx import SMPLX
+import bpy
+
+def create_smplx_material(alpha=1.0):
+    """
+    Build a Principled BSDF with:
+      • high roughness, low specular
+      • a bit of subsurface scattering
+      • subtle sheen
+      • noise‐driven roughness variation
+    """
+    name = "SMPLX_Mat"
+    mat  = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    # clear any default nodes
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # Output
+    out_bsdf = nodes.new("ShaderNodeOutputMaterial")
+    out_bsdf.location = (400, 0)
+
+    # Principled BSDF
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (0, 0)
+    bsdf.inputs["Base Color"].default_value       = (1.0, 0.4, 0.4, 1.0)
+    bsdf.inputs["Alpha"].default_value            = alpha 
+    bsdf.inputs["Roughness"].default_value        = 0.7      # soften highlights
+    if "Specular" in bsdf.inputs:
+        bsdf.inputs["Specular"].default_value=0.2
+    else:
+        bsdf.inputs["Specular IOR Level"].default_value = 0.2
+        
+    bsdf.inputs["Metallic"].default_value         = 0.0      # non‐metal
+    # -- Subsurface (called “Subsurface Weight”) --
+    if "Subsurface Weight" in bsdf.inputs:
+        bsdf.inputs["Subsurface Weight"].default_value = 0.1
+    if "Subsurface Radius" in bsdf.inputs:
+        bsdf.inputs["Subsurface Radius"].default_value = (0.1, 0.1, 0.1)
+
+    # -- Sheen --
+    if "Sheen Weight" in bsdf.inputs:
+        bsdf.inputs["Sheen Weight"].default_value = 0.15
+    if "Sheen Tint" in bsdf.inputs:
+        bsdf.inputs["Sheen Tint"].default_value = (0.5, 0.5, 0.5, 1.0)
+
+    # Noise for micro‐variation in roughness
+    noise = nodes.new("ShaderNodeTexNoise")
+    noise.location = (-300, 0)
+    noise.inputs["Scale"].default_value = 20.0
+    links.new(noise.outputs["Fac"], bsdf.inputs["Roughness"])
+
+    # Link BSDF → Output
+    links.new(bsdf.outputs["BSDF"], out_bsdf.inputs["Surface"])
+    return mat
 
 def convert_to_mesh_once(
     npz_path,
@@ -88,3 +145,4 @@ def convert_to_mesh_once(
         print(f"[INFO] Saved: {fname}")
 
     print("[✓] Done.")
+    

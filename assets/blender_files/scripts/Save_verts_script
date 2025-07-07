@@ -1,0 +1,28 @@
+import bpy
+import os
+
+# Ensure you're in Object Mode so we can access selection data
+bpy.ops.object.mode_set(mode='OBJECT')
+
+# Get the active object (your SMPL-X mesh)
+obj = bpy.context.object
+verts = obj.data.vertices
+
+# Collect indices of selected vertices
+selected_verts = [v.index for v in verts if v.select]
+
+# Print in Blender console
+print(f"Selected {len(selected_verts)} vertices:")
+for i,vert in enumerate(selected_verts):
+    print(f"Vertex {i} - {vert}")
+
+
+# Save to file (edit this path!)
+save_path = "/Users/keaton/Documents/Research/SMPL_PSU/vertices/left_heel.txt"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+#with open(save_path, 'w') as f:
+#    for idx in selected_verts:
+#        f.write(f"{idx}\n")
+
+print(f"Saved selected vertex indices to: {save_path}")

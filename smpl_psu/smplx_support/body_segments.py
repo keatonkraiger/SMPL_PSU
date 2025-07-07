@@ -1,6 +1,6 @@
 import torch
 
-from src.smplx_support.part_volume import PartVolume
+from smpl_psu.smplx_support.part_volume import PartVolume
 
 SMPLX_PART_BOUNDS = './assets/smplx/part_meshes_ply/smplx_segments_bounds.pkl'
 FID_TO_PART = './assets/smplx/part_meshes_ply/fid_to_part.pkl'
