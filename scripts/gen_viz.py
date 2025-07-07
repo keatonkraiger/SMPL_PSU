@@ -498,6 +498,7 @@ if __name__ == "__main__":
     smplx_dir = '/mnt/d/Data/PSU100/SMPLX'
 
     for i in range(1, 11):
+        print(f"[INFO] Processing Subject {i}")
         subject = f"Subject{i}"
         sub_dir = os.path.join(smplx_dir, subject)
 
@@ -521,7 +522,8 @@ if __name__ == "__main__":
             take_name = f"Take_{take_number:02d}"
             take_cfg = setup_dirs(take_cfg, subject, take_name)
             take_cfg['mesh']['npz_path'] = take_path
-           
+            
+            print(f"[INFO] Processing {take_name} for {subject}.") 
             try:
                 main(take_cfg)
             except Exception as e:
