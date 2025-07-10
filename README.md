@@ -45,8 +45,8 @@ Assuming you have the SOMA-derived models from the PSU dataset (the Subject_wise
 
 These values can be changed in the `cfg` dictionary at the top of the `gen_viz.py` file and a few may be set via command line arguments. Please see the code for more details.
 
-To generate the visualizations, run the following command:
+To generate the take renderings as MP4s and a single blender animation for every subject-take, run the following command:
 
 ```bash
-python scripts/gen_viz.py 
+python scripts/gen_viz.py --render_images --create_animation
 ```

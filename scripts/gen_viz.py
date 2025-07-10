@@ -498,13 +498,14 @@ if __name__ == "__main__":
     args = argparse.ArgumentParser(description="Generate SMPLX meshes and render them.")
     args.add_argument('--ds_rate', type=int, default=1, help="Downsample")
     args.add_argument('--smplx_data_dir', type=str, default='/mnt/d/Data/PSU100/SMPLX', help="Path to SMPLX Subject_wise data directory")
-    args.add_argument('--stop_early', action='store_true', help="Stop after processing the first MAX_FRAMES frames")
     args.add_argument('--subjects', type=int, nargs='+', default=list(range(1, 11)), help="List of subject numbers to process (default: 1-10)")
+    args.add_argument('--render_images', action='store_true', help="Render images and create video")
+    args.add_argument('--create_animation', action='store_true', help="Create a single animation from the blends")
     args = args.parse_args()
     
     cfg_global['mesh']['ds_rate'] = args.ds_rate
-    cfg_global['render']['stop_early'] = args.stop_early
-    
+    cfg_global['render']['create_animation'] = args.create_animation
+    cfg_global['output']['render_images'] = args.render_images 
 
     for i in args.subjects:
         print(f"[INFO] Processing Subject {i}")
