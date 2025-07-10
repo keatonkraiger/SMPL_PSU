@@ -34,4 +34,19 @@ Once all the necessary packages are installed, you should download the [SMPL](ht
 
 ## Generating visualizations of SOMA data
 
-Assuming you have the SOMA-derived models from the PSU dataset, you can create visualizations for each take with the `scripts/gen_viz.py` file. Currently, the script has a hardcoded cfg dict that specifies paths, params, etc. You can modify this to suit your needs. 
+Assuming you have the SOMA-derived models from the PSU dataset (the Subject_wise folder), you can create visualizations for each take with the `scripts/gen_viz.py` file. `gen_viz.py` has a global configuration `cfg` to set global parameters such as directories, sample rate, etc. Some important parameters include:
+
+- `ds_rate`: The downsample rate for the frames. For example, if set to 5, every 5th frame will be processed.
+- `n_jobs`: The number of parallel jobs to run for processing frames. This can speed up the processing significantly, especially on multi-core machines.
+- `render_images`: If set to `True`, it will render images for each frame and generate a video from these images.
+- `cleanup_imgs`: If set to `True`, it will remove the individual frame images after creating the video.
+- `device`: The device to use for processing rendering, e.g., 'GPU' or 'CPU'.
+- `camera_view`: The camera perspective to use for rendering, e.g., 1 or 2.
+
+These values can be changed in the `cfg` dictionary at the top of the `gen_viz.py` file and a few may be set via command line arguments. Please see the code for more details.
+
+To generate the visualizations, run the following command:
+
+```bash
+python scripts/gen_viz.py 
+```

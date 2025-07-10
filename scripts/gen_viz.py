@@ -1,3 +1,4 @@
+import argparse
 import os
 from pathlib import Path
 import json
@@ -22,9 +23,9 @@ from smpl_psu.utils.viz import compare_com_trajectory
 # ------------------------------------------------------------------------------
 #                                     CONFIG
 # ------------------------------------------------------------------------------
-MAX_FRAMES=1000
-OVERWRITE=True
-DEBUG=True
+MAX_FRAMES=np.inf
+OVERWRITE=False
+DEBUG=False
 
 cfg_global = {
     'mesh': {
@@ -32,10 +33,10 @@ cfg_global = {
         'model_folder':       'body_models/smplx',          # contains e.g. SMPLX_FEMALE.npz
         'output_obj_dir':     'output_objs',
         'gender':             'female',
-        'ds_rate':            2,     # down-sample every N frames
+        'ds_rate':            1,     # down-sample every N frames
         'num_betas':          10,
         'scale_cm_to_m':      False,
-        'n_jobs':             1,     # number of parallel jobs for obj conversion
+        'n_jobs':             16,     # number of parallel jobs for obj conversion
     },
     'motion': {
         'coordinate_system': 'global',  # 'local' or 'global'
@@ -46,13 +47,13 @@ cfg_global = {
     'output': {
         'save_npz': True,  # save the .npz file after conveting everything
         'save_blend': True,  # save the .blend file after rendering
-        'create_animation': True,  # create a single animation from all frames
+        'create_animation': False,  # create a single animation from all frames
         'render_images': False,  # whether to render images
     },
     'dirs': {
         'save_dir':         'output',  # where to save all results
         'render_out_dir':     'render',
-        'cleanup_objs':     False,  # remove old output dirs if they exist
+        'cleanup_objs':     True,  # remove old output dirs if they exist
         'cleanup_imgs':   False,  # remove old output dirs if they exist
     },
     'render': {
@@ -112,7 +113,7 @@ def rotate_points_xyz(pts, angles_deg):
 
 def process_frame(i, model, trans, root_orient, pose_body, pose_hand, jaw_pose, eye_pose,
                   betas, scale, coordinate_system, theta_z_deg, part_vid_fid, part_bounds,
-                  obj_dir, npz_dir, save_npz):
+                  obj_dir, npz_dir, save_npz, ds_rate):
     name = os.path.join(obj_dir, f"frame_{i:05d}.obj")
     if not OVERWRITE and os.path.exists(name):
         if DEBUG:
@@ -160,7 +161,9 @@ def process_frame(i, model, trans, root_orient, pose_body, pose_hand, jaw_pose, 
         np.savez_compressed(save_path,
                             verts=verts.astype(np.float32),
                             faces=faces.astype(np.int32),
-                            com=com.astype(np.float32))
+                            com=com.astype(np.float32),
+                            frame=i,
+                            ds_rate=ds_rate)
 
     return {'frame': i, 'path': name, 'com': com}
 
@@ -181,7 +184,7 @@ def convert_npz_to_objs(cfg):
     jaw_pose    = data['pose_jaw']
     eye_pose    = data['pose_eye']
     betas       = data['betas'][:cfg['mesh']['num_betas']]
-
+    
     scale = 0.01 if cfg['mesh']['scale_cm_to_m'] else 1.0  # cm → m
     coordinate_system = cfg['motion']['coordinate_system']
 
@@ -192,10 +195,6 @@ def convert_npz_to_objs(cfg):
         print(f"[INFO] Local mode: rotating subject -{theta_z_deg:.2f}° to face camera")
     else:
         theta_z_deg = 0.0
-
-    # Load COM helper data once
-    part_vid_fid = load_pickle(PART_VID_FID)        # dict part → {vert_id, face_id}
-    part_bounds  = load_pickle(SMPLX_PART_BOUNDS)   # dict part → boundary vids
 
     # Ensure output dirs
     os.makedirs(cfg['dirs']['obj_dir'], exist_ok=True)
@@ -218,7 +217,8 @@ def convert_npz_to_objs(cfg):
         part_bounds=load_pickle(SMPLX_PART_BOUNDS),
         obj_dir=cfg['dirs']['obj_dir'],
         npz_dir=cfg['dirs']['npz_dir'],
-        save_npz=cfg['output'].get('save_npz', False)
+        save_npz=cfg['output'].get('save_npz', False),
+        ds_rate=cfg['mesh']['ds_rate'],
     )
 
     # Frame indices to process
@@ -364,7 +364,7 @@ def import_and_render(objs, cfg):
                 
             bpy.data.objects.remove(obj, do_unlink=True)
 
-        if cfg['render']['stop_early'] or i >= MAX_FRAMES:
+        if cfg['render']['stop_early'] and i >= MAX_FRAMES:
             break
 # ------------------------------------------------------------------------------
 #                                     MAIN
@@ -495,12 +495,21 @@ def extract_take_number(filename):
 
 from copy import deepcopy
 if __name__ == "__main__":
-    smplx_dir = '/mnt/d/Data/PSU100/SMPLX'
+    args = argparse.ArgumentParser(description="Generate SMPLX meshes and render them.")
+    args.add_argument('--ds_rate', type=int, default=1, help="Downsample")
+    args.add_argument('--smplx_data_dir', type=str, default='/mnt/d/Data/PSU100/SMPLX', help="Path to SMPLX Subject_wise data directory")
+    args.add_argument('--stop_early', action='store_true', help="Stop after processing the first MAX_FRAMES frames")
+    args.add_argument('--subjects', type=int, nargs='+', default=list(range(1, 11)), help="List of subject numbers to process (default: 1-10)")
+    args = args.parse_args()
+    
+    cfg_global['mesh']['ds_rate'] = args.ds_rate
+    cfg_global['render']['stop_early'] = args.stop_early
+    
 
-    for i in range(1, 11):
+    for i in args.subjects:
         print(f"[INFO] Processing Subject {i}")
         subject = f"Subject{i}"
-        sub_dir = os.path.join(smplx_dir, subject)
+        sub_dir = os.path.join(args.smplx_data_dir, subject)
 
         # Detect gender
         if os.path.exists(os.path.join(sub_dir, "male_stagei.npz")):
@@ -522,14 +531,15 @@ if __name__ == "__main__":
             take_name = f"Take_{take_number:02d}"
             take_cfg = setup_dirs(take_cfg, subject, take_name)
             take_cfg['mesh']['npz_path'] = take_path
-            
+           
             print(f"[INFO] Processing {take_name} for {subject}.") 
+            
             try:
                 main(take_cfg)
             except Exception as e:
                 print(f"[ERROR] Failed to process {take_name} for {subject}: {e}")
                 continue
-             
+                
             npz_dir = take_cfg['dirs']['npz_dir']
             mat_com_path = f"/mnt/d/Data/PSU100/Subject_wise/{subject}/CoM_{take_number}.mat"
             com_vis_dir = take_cfg['dirs']['com_dir']
@@ -538,10 +548,7 @@ if __name__ == "__main__":
             diffs = compare_com_trajectory(subject, take_name, npz_dir, mat_com_path, com_vis_dir, ds_rate=cfg_global['mesh']['ds_rate'], create_com_movie=False)
             if diffs is not None:
                 all_diffs.append(diffs)
-                # Save diffs to a npy file
-                diffs_path = os.path.join(com_vis_dir, f"com_diffs.npy")
-                np.save(diffs_path, diffs)
-
+            
         # Save overall stats per subject
         if all_diffs:
             all_diffs = np.concatenate(all_diffs, axis=0)
@@ -550,11 +557,13 @@ if __name__ == "__main__":
 
 
             fig, ax = plt.subplots()
-            ax.bar(['X', 'Y', 'Z'], mean_err, yerr=std_err, capsize=5, colors=['#1f77b4', '#ff7f0e', '#2ca02c'], edgecolor='black')
+            ax.bar(['X', 'Y', 'Z'], mean_err, yerr=std_err, capsize=5, color=['#1f77b4', '#ff7f0e', '#2ca02c'], edgecolor='black')
             ax.set_ylabel("Mean Absolute CoM Error (mm)")
             ax.set_title(f"{subject} — Overall CoM Error")
-            
-            summary_path = os.path.join(cfg_global['dirs']['save_dir'], subject, 'com_viz', f"{subject}_com_summary.png")
+
+            summary_path = os.path.join(cfg['dirs']['save_dir'], 'CoM_diffs', f"{subject}.png")
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            plt.tight_layout()
             fig.savefig(summary_path, dpi=200)
             plt.close(fig)
 

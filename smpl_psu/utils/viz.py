@@ -8,6 +8,7 @@ from matplotlib.animation import FuncAnimation
 import trimesh
 import numpy as np
 from PIL import Image
+from tqdm import tqdm
 import io
 
 def compare_com_trajectory(subject, take, npz_dir, mat_path, save_dir, ds_rate=5, create_com_movie=False):
@@ -20,27 +21,30 @@ def compare_com_trajectory(subject, take, npz_dir, mat_path, save_dir, ds_rate=5
     # Load CoM from NPZ
     print(f"[INFO] Loading CoM from NPZ files in {npz_dir} for {subject} {take}")
     npz_coms = []
+    frames = []
     for npz_file in npz_files:
         data = np.load(npz_file)
         com = data['com']
         com = np.array((com[0], -com[2], com[1])) * 10e2  # reorder & convert to mm
         npz_coms.append(com)
+        frames.append(data['frame'])
 
     # Load ground-truth CoM from .mat
     mat_coms = loadmat(mat_path)["CoM"]
     mat_coms = mat_coms[::ds_rate]  # downsample to match ds_rate
     npz_arr, mat_arr, diffs = [], [], []
     print(f"[INFO] Comparing CoM trajectories for {subject} {take}")
-    invalid = 0
-    for i in range(min(len(npz_coms), len(mat_coms))):
+    invalid = []
+   
+    for i, frame in tqdm(enumerate(frames), desc="Processing CoM diffs", total=len(frames)):
         if mat_coms[i, -1] == 0:  # invalid frame
-            invalid += 1
+            invalid.append(i)
             continue
         npz_arr.append(npz_coms[i])
         mat_arr.append(mat_coms[i, :3])
         diffs.append(npz_coms[i] - mat_coms[i, :3])
 
-    print(f"[INFO] Found {len(npz_arr)} valid frames, {invalid} invalid mat CoM frames in {take}")
+    print(f"[INFO] Found {len(npz_arr)} valid frames, {len(invalid)} invalid mat CoM frames in {take}")
     npz_arr = np.array(npz_arr)
     mat_arr = np.array(mat_arr)
     diffs = np.array(diffs)
@@ -51,6 +55,7 @@ def compare_com_trajectory(subject, take, npz_dir, mat_path, save_dir, ds_rate=5
 
     # Save npz, mat, diff, and num of invalid mat frames
     npy_path = os.path.join(save_dir, f"com_comparison.npz")
+    invalid = np.array(invalid)
     data = {
         'npz_coms': npz_arr,
         'mat_coms': mat_arr,
@@ -64,7 +69,7 @@ def compare_com_trajectory(subject, take, npz_dir, mat_path, save_dir, ds_rate=5
     fig, ax = plt.subplots()
     mean_error = np.mean(np.abs(diffs), axis=0)
     std_error = np.std(np.abs(diffs), axis=0)
-    ax.bar(np.arange(3), mean_error, yerr=std_error, capsize=5, edgecolor='black', colors=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    ax.bar(np.arange(3), mean_error, yerr=std_error, capsize=5, edgecolor='black', color=['#1f77b4', '#ff7f0e', '#2ca02c'])
     ax.set_xticks([0, 1, 2])
     ax.set_xticklabels(['X', 'Y', 'Z'])
     ax.set_ylabel("Mean Absolute Error (mm)")
